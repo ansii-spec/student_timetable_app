@@ -30,7 +30,7 @@ String get kApiBaseUrl {
   // If running on an Android device (Emulator or Physical phone)
   if (!kIsWeb && Platform.isAndroid) {
     // ⚠️ Replace 10.0.2.2 with your computer's exact Local Wi-Fi IP address
-    return 'http://172.26.0.105:8000';
+    return 'http://192.168.18.105:8000';
   }
   
   return 'http://localhost:8000';
@@ -123,6 +123,8 @@ ThemeData buildAppDarkTheme() {
 
 /// Timetable JSON cache per roll number (SharedPreferences).
 String timetableCacheKey(String rollNumber) => 'cached_timetable_$rollNumber';
+String theoryExamsCacheKey(String rollNumber) =>
+    'cached_theory_exams_$rollNumber';
 
 TimetablePayload? parseTimetablePayloadFromJsonString(String raw) {
   try {
@@ -268,6 +270,77 @@ class TimetablePayload {
   final List<ScheduleEntry> schedule;
 }
 
+class ExamEntry {
+  const ExamEntry({
+    required this.date,
+    required this.venue,
+    required this.time,
+    required this.courseCode,
+    required this.batch,
+    required this.subject,
+    required this.teacher,
+    this.codeWithSection,
+    this.extendedTime,
+  });
+
+  factory ExamEntry.fromJson(Map<String, dynamic> json) {
+    return ExamEntry(
+      date: (json['date'] as String? ?? '').trim(),
+      venue: (json['venue'] as String? ?? '').trim(),
+      time: (json['time'] as String? ?? '').trim(),
+      courseCode: (json['course_code'] as String? ?? '').trim(),
+      batch: (json['batch'] as String? ?? '').trim(),
+      subject: (json['subject'] as String? ?? '').trim(),
+      teacher: (json['teacher'] as String? ?? '').trim(),
+      codeWithSection: (json['code_with_section'] as String?)?.trim(),
+      extendedTime: (json['extended_time'] as String?)?.trim(),
+    );
+  }
+
+  final String date;
+  final String venue;
+  final String time;
+  final String courseCode;
+  final String batch;
+  final String subject;
+  final String teacher;
+  final String? codeWithSection;
+  final String? extendedTime;
+}
+
+class ExamsPayload {
+  const ExamsPayload({required this.labExams, required this.theoryExams});
+
+  final List<ExamEntry> labExams;
+  final List<TheoryExamEntry> theoryExams;
+}
+
+class TheoryExamEntry {
+  const TheoryExamEntry({
+    required this.courseCode,
+    required this.courseName,
+    required this.examDate,
+    required this.startTime,
+    required this.endTime,
+  });
+
+  factory TheoryExamEntry.fromJson(Map<String, dynamic> json) {
+    return TheoryExamEntry(
+      courseCode: (json['course_code'] as String? ?? '').trim(),
+      courseName: (json['course_name'] as String? ?? '').trim(),
+      examDate: (json['exam_date'] as String? ?? '').trim(),
+      startTime: (json['start_time'] as String? ?? '').trim(),
+      endTime: (json['end_time'] as String? ?? '').trim(),
+    );
+  }
+
+  final String courseCode;
+  final String courseName;
+  final String examDate;
+  final String startTime;
+  final String endTime;
+}
+
 // --- Time helpers -----------------------------------------------------------------
 const List<String> kWeekdays = <String>[
   'Monday',
@@ -330,6 +403,66 @@ int startMinutesFromTimeSlot(String timeSlot) {
 int weekdaySortKey(String dayName) {
   final int i = kWeekdays.indexOf(dayName);
   return i >= 0 ? i : 99;
+}
+
+const Map<int, String> kLabSlotToExtendedLabel = <int, String>{
+  0: '08:00 AM - 11:00 AM',
+  1: '09:30 AM - 12:30 PM',
+  2: '11:00 AM - 02:00 PM',
+  3: '12:30 PM - 03:30 PM',
+  4: '02:00 PM - 05:00 PM',
+  5: '03:30 PM - 06:30 PM',
+};
+
+const Map<String, int> kRegularSlotLabelToIndex = <String, int>{
+  '08:00 AM - 09:30 AM': 0,
+  '09:30 AM - 11:00 AM': 1,
+  '11:00 AM - 12:30 PM': 2,
+  '12:30 PM - 02:00 PM': 3,
+  '02:00 PM - 03:30 PM': 4,
+  '03:30 PM - 05:00 PM': 5,
+  '05:00 PM - 06:30 PM': 6,
+};
+
+bool isLabCodeWithSection(String codeWithSection) {
+  final List<String> parts = codeWithSection.split(',');
+  if (parts.isEmpty) {
+    return false;
+  }
+  final String baseCode = parts[0].trim();
+  return baseCode.length >= 2 && baseCode[1].toUpperCase() == 'L';
+}
+
+String? sectionFromCodeWithSection(String codeWithSection) {
+  final List<String> parts = codeWithSection.split(',');
+  if (parts.length < 2) {
+    return null;
+  }
+  final String section = parts[1].trim();
+  return section.isEmpty ? null : section;
+}
+
+String extendedLabTimeFromRaw(String raw) {
+  final String value = raw.trim();
+  if (value.isEmpty) {
+    return value;
+  }
+  final int? maybeSlot = int.tryParse(value);
+  if (maybeSlot != null) {
+    return kLabSlotToExtendedLabel[maybeSlot] ?? value;
+  }
+  final int? labelSlot = kRegularSlotLabelToIndex[value];
+  if (labelSlot != null) {
+    return kLabSlotToExtendedLabel[labelSlot] ?? value;
+  }
+  final RegExpMatch? m = RegExp(r'\d+').firstMatch(value);
+  if (m != null) {
+    final int? extracted = int.tryParse(m.group(0)!);
+    if (extracted != null && kLabSlotToExtendedLabel.containsKey(extracted)) {
+      return kLabSlotToExtendedLabel[extracted]!;
+    }
+  }
+  return value;
 }
 
 bool isDuringSlot(DateTime now, String timeSlot) {
@@ -948,7 +1081,7 @@ class _MainShellState extends State<MainShell> {
             error: _error,
             onRefresh: _load,
           ),
-          const ExamsPlaceholderTab(),
+          ExamsScreen(profile: widget.profile),
         ],
       ),
       bottomNavigationBar: BottomNavigationBar(
@@ -1629,39 +1762,305 @@ class _SessionCard extends StatelessWidget {
   }
 }
 
-// --- Exams placeholder ------------------------------------------------------------
-class ExamsPlaceholderTab extends StatelessWidget {
-  const ExamsPlaceholderTab({super.key});
+// --- Exams ------------------------------------------------------------------------
+class ExamsScreen extends StatefulWidget {
+  const ExamsScreen({super.key, required this.profile});
+
+  final StudentProfile profile;
+
+  @override
+  State<ExamsScreen> createState() => _ExamsScreenState();
+}
+
+class _ExamsScreenState extends State<ExamsScreen> {
+  bool _loading = true;
+  String? _error;
+  ExamsPayload _payload = const ExamsPayload(
+    labExams: <ExamEntry>[],
+    theoryExams: <TheoryExamEntry>[],
+  );
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadExams());
+  }
+
+  Future<void> _loadExams() async {
+    final SharedPreferences prefs = await SharedPreferences.getInstance();
+    final String theoryCacheKey = theoryExamsCacheKey(widget.profile.rollNumber);
+    final String? cachedTheoryRaw = prefs.getString(theoryCacheKey);
+    final List<TheoryExamEntry> cachedTheory = <TheoryExamEntry>[];
+    if (cachedTheoryRaw != null && cachedTheoryRaw.isNotEmpty) {
+      try {
+        final dynamic decoded = jsonDecode(cachedTheoryRaw);
+        if (decoded is List<dynamic>) {
+          cachedTheory.addAll(
+            decoded.map(
+              (dynamic e) => TheoryExamEntry.fromJson(
+                e as Map<String, dynamic>,
+              ),
+            ),
+          );
+        }
+      } catch (_) {
+        // Ignore bad cache and fetch from network.
+      }
+    }
+
+    setState(() {
+      _loading = true;
+      _error = null;
+      if (cachedTheory.isNotEmpty) {
+        _payload = ExamsPayload(
+          labExams: _payload.labExams,
+          theoryExams: cachedTheory,
+        );
+      }
+    });
+
+    final String encodedRoll = Uri.encodeComponent(widget.profile.rollNumber);
+    final Uri labUri = Uri.parse('$kApiBaseUrl/api/v1/student/lab-exams/$encodedRoll');
+    final Uri theoryUri = Uri.parse(
+      '$kApiBaseUrl/api/v1/student/theory-exams/$encodedRoll',
+    );
+
+    try {
+      final List<http.Response> responses = await Future.wait(<Future<http.Response>>[
+        http.get(labUri).timeout(const Duration(seconds: 6)),
+        http.get(theoryUri).timeout(const Duration(seconds: 6)),
+      ]);
+
+      final http.Response labRes = responses[0];
+      final http.Response theoryRes = responses[1];
+      final List<ExamEntry> parsedLabs = <ExamEntry>[];
+      List<TheoryExamEntry> parsedTheory = cachedTheory;
+
+      if (labRes.statusCode == 200) {
+        final Map<String, dynamic> json =
+            jsonDecode(labRes.body) as Map<String, dynamic>;
+        final List<dynamic> raw = json['lab_exams'] as List<dynamic>? ?? <dynamic>[];
+        for (final dynamic e in raw) {
+          final ExamEntry entry = ExamEntry.fromJson(e as Map<String, dynamic>);
+          final String codeWithSection = entry.codeWithSection ??
+              '${entry.courseCode},${entry.batch}';
+          final String? section = sectionFromCodeWithSection(codeWithSection);
+          if (!isLabCodeWithSection(codeWithSection) || section == null) {
+            continue;
+          }
+          parsedLabs.add(entry);
+        }
+      }
+
+      if (theoryRes.statusCode == 200) {
+        final Map<String, dynamic> json =
+            jsonDecode(theoryRes.body) as Map<String, dynamic>;
+        final List<dynamic> raw =
+            json['theory_exams'] as List<dynamic>? ?? <dynamic>[];
+        parsedTheory = raw
+            .map(
+              (dynamic e) => TheoryExamEntry.fromJson(
+                e as Map<String, dynamic>,
+              ),
+            )
+            .toList();
+        await prefs.setString(
+          theoryCacheKey,
+          jsonEncode(
+            parsedTheory
+                .map(
+                  (TheoryExamEntry e) => <String, String>{
+                    'course_code': e.courseCode,
+                    'course_name': e.courseName,
+                    'exam_date': e.examDate,
+                    'start_time': e.startTime,
+                    'end_time': e.endTime,
+                  },
+                )
+                .toList(),
+          ),
+        );
+      }
+
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _payload = ExamsPayload(labExams: parsedLabs, theoryExams: parsedTheory);
+        _loading = false;
+      });
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _loading = false;
+        _error = 'Could not fetch exams right now. Pull down to retry.';
+      });
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Exams')),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: const <Widget>[
-          Card(
-            child: ListTile(
-              leading: Icon(Icons.edit_calendar_outlined, color: kFastBlue),
-              title: Text('Midterms & finals'),
-              subtitle: Text('Phase 2 will sync exam dates and seating.'),
+      body: RefreshIndicator(
+        color: kFastBlue,
+        onRefresh: _loadExams,
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: const EdgeInsets.all(16),
+          children: <Widget>[
+            if (_loading) const LinearProgressIndicator(minHeight: 3),
+            if (_error != null)
+              Card(
+                color: Colors.red.shade50,
+                child: Padding(
+                  padding: const EdgeInsets.all(14),
+                  child: Text(
+                    _error!,
+                    style: TextStyle(color: Colors.red.shade900),
+                  ),
+                ),
+              ),
+            _ExamSectionHeader(
+              title: 'Lab Exams',
+              icon: Icons.science_outlined,
+              subtitle: 'Lab mapping uses code + section (e.g., AL2002,BCS-4B).',
             ),
-          ),
-          Card(
-            child: ListTile(
-              leading: Icon(Icons.notifications_active_outlined, color: kFastBlue),
-              title: Text('Reminders'),
-              subtitle: Text('Optional push reminders before papers.'),
+            const SizedBox(height: 8),
+            if (_payload.labExams.isEmpty)
+              const Card(
+                child: ListTile(
+                  leading: Icon(Icons.info_outline, color: kFastBlue),
+                  title: Text('No lab exams found'),
+                  subtitle: Text('Upload lab datesheet or verify registered lab sections.'),
+                ),
+              )
+            else
+              ..._payload.labExams.map(
+                (ExamEntry e) => _LabExamCard(entry: e),
+              ),
+            const SizedBox(height: 16),
+            const _ExamSectionHeader(
+              title: 'Theory Exams',
+              icon: Icons.menu_book_outlined,
+              subtitle: 'Theory schedule for your registered course codes.',
             ),
+            const SizedBox(height: 8),
+            if (_payload.theoryExams.isEmpty)
+              const Card(
+                child: ListTile(
+                  leading: Icon(Icons.info_outline, color: kFastBlue),
+                  title: Text('No theory exams found'),
+                ),
+              )
+            else
+              ..._payload.theoryExams.map(
+                (TheoryExamEntry e) => _TheoryExamCard(entry: e),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ExamSectionHeader extends StatelessWidget {
+  const _ExamSectionHeader({
+    required this.title,
+    required this.icon,
+    required this.subtitle,
+  });
+
+  final String title;
+  final IconData icon;
+  final String subtitle;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: <Widget>[
+        Icon(icon, color: kFastBlue),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Text(
+                title,
+                style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                      fontWeight: FontWeight.w800,
+                      color: kFastBlue,
+                    ),
+              ),
+              Text(subtitle, style: Theme.of(context).textTheme.bodySmall),
+            ],
           ),
-          Card(
-            child: ListTile(
-              leading: Icon(Icons.table_chart_outlined, color: kFastBlue),
-              title: Text('Export'),
-              subtitle: Text('ICS / PDF export for your calendar apps.'),
+        ),
+      ],
+    );
+  }
+}
+
+class _LabExamCard extends StatelessWidget {
+  const _LabExamCard({required this.entry});
+
+  final ExamEntry entry;
+
+  @override
+  Widget build(BuildContext context) {
+    final String codeWithSection = entry.codeWithSection ??
+        '${entry.courseCode},${entry.batch}';
+    final String? section = sectionFromCodeWithSection(codeWithSection);
+    final String extended = (entry.extendedTime != null && entry.extendedTime!.isNotEmpty)
+        ? entry.extendedTime!
+        : extendedLabTimeFromRaw(entry.time);
+
+    return Card(
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(14),
+        side: const BorderSide(color: kAccentGold, width: 1.2),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Text(
+              entry.subject,
+              style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.w800,
+                    color: kFastBlue,
+                  ),
             ),
-          ),
-        ],
+            const SizedBox(height: 6),
+            Text('${entry.date} · ${entry.venue}'),
+            const SizedBox(height: 4),
+            Text('Duration (Lab 2-slot): $extended'),
+            const SizedBox(height: 4),
+            Text('${entry.courseCode} · ${section ?? entry.batch} · ${entry.teacher}'),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _TheoryExamCard extends StatelessWidget {
+  const _TheoryExamCard({required this.entry});
+
+  final TheoryExamEntry entry;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      child: ListTile(
+        leading: const Icon(Icons.description_outlined, color: kFastBlue),
+        title: Text(entry.courseName),
+        subtitle: Text(
+          '${entry.examDate}\n${entry.startTime} - ${entry.endTime}\n${entry.courseCode}',
+        ),
       ),
     );
   }
