@@ -40,15 +40,7 @@ DAY_ORDER: dict[str, int] = {
     "Saturday": 5,
     "Sunday": 6,
 }
-
-LAB_SLOT_TO_3H_LABEL: dict[int, str] = {
-    0: "08:00 AM - 11:00 AM",
-    1: "09:30 AM - 12:30 PM",
-    2: "11:00 AM - 02:00 PM",
-    3: "12:30 PM - 03:30 PM",
-    4: "02:00 PM - 05:00 PM",
-    5: "03:30 PM - 06:30 PM",
-}
+# REMOVED
 
 SHEET_TIMETABLE = "Timetable Timing"
 SHEET_STUDENTS = "Students"
@@ -87,7 +79,13 @@ def init_db() -> None:
     with get_connection() as conn:
         conn.executescript(
             """
-            DROP TABLE IF EXISTS courses;
+            CREATE TABLE IF NOT EXISTS courses (
+                code TEXT NOT NULL,
+                batch TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                teacher TEXT NOT NULL,
+                PRIMARY KEY (code, batch)
+            );
 
             CREATE TABLE IF NOT EXISTS timetable (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -252,24 +250,7 @@ def _is_lab_code(code: str) -> bool:
     # Lab if second character in the base course code is 'L' (e.g., AL2002).
     return len(code) >= 2 and code[1].upper() == "L"
 
-
-def _lab_extended_time_label(raw_time: str) -> str:
-    cleaned = _as_clean_text(raw_time)
-    if not cleaned:
-        return cleaned
-    if cleaned in LABEL_TO_SLOT:
-        slot_idx = LABEL_TO_SLOT[cleaned]
-        return LAB_SLOT_TO_3H_LABEL.get(slot_idx, cleaned)
-    if cleaned.isdigit():
-        slot_idx = int(cleaned)
-        return LAB_SLOT_TO_3H_LABEL.get(slot_idx, cleaned)
-    maybe_slot = re.search(r"\d+", cleaned)
-    if maybe_slot:
-        slot_idx = int(maybe_slot.group(0))
-        if slot_idx in LAB_SLOT_TO_3H_LABEL:
-            return LAB_SLOT_TO_3H_LABEL[slot_idx]
-    return cleaned
-
+# REMOVED
 
 async def _read_workbook(file: UploadFile) -> pd.ExcelFile:
     if not file.filename or not file.filename.lower().endswith((".xlsx", ".xlsm")):
@@ -283,16 +264,30 @@ async def _read_workbook(file: UploadFile) -> pd.ExcelFile:
 
 def _extract_timetable_and_students(
     workbook: pd.ExcelFile,
-) -> tuple[list[tuple[str, str, int, str]], list[tuple[str, str]]]:
-    for name in (SHEET_TIMETABLE, SHEET_STUDENTS):
+) -> tuple[list[tuple[str, str, str, str]], list[tuple[str, str, int, str]], list[tuple[str, str]]]:
+    for name in ("Courses", SHEET_TIMETABLE, SHEET_STUDENTS):
         if name not in workbook.sheet_names:
             raise HTTPException(
                 status_code=400,
                 detail=f"Missing sheet {name!r}. Found: {workbook.sheet_names}",
             )
 
+    courses_df = _rename_columns(pd.read_excel(workbook, sheet_name="Courses"))
     timetable_df = _rename_columns(pd.read_excel(workbook, sheet_name=SHEET_TIMETABLE))
     students_df = _rename_columns(pd.read_excel(workbook, sheet_name=SHEET_STUDENTS))
+
+    col_map_courses = {
+        "code": {"code", "course_code", "coursecode"},
+        "batch": {"batch", "section"},
+        "subject": {"subject", "course_title", "title"},
+        "teacher": {"teacher", "instructor", "faculty"},
+    }
+    for target, aliases in col_map_courses.items():
+        if target not in courses_df.columns:
+            for a in aliases:
+                if a in courses_df.columns:
+                    courses_df = courses_df.rename(columns={a: target})
+                    break
 
     timetable_df = _apply_aliases(
         timetable_df,
@@ -311,8 +306,22 @@ def _extract_timetable_and_students(
         },
     )
 
+    _require_columns(courses_df, {"code", "batch", "subject", "teacher"}, "Courses sheet")
     _require_columns(timetable_df, {"day", "location", "slot", "code"}, "Timetable sheet")
     _require_columns(students_df, {"rollnumber", "code"}, "Students sheet")
+
+    course_rows: list[tuple[str, str, str, str]] = []
+    for _, row in courses_df.iterrows():
+        code = _normalize_code(row["code"])
+        if not code:
+            continue
+        batch = str(row["batch"]).strip()
+        course_rows.append((
+            code,
+            batch,
+            str(row["subject"]).strip(),
+            str(row["teacher"]).strip(),
+        ))
 
     timetable_rows: list[tuple[str, str, int, str]] = []
     for _, row in timetable_df.iterrows():
@@ -337,7 +346,7 @@ def _extract_timetable_and_students(
         if roll and code:
             student_rows.append((roll, code))
 
-    return timetable_rows, student_rows
+    return course_rows, timetable_rows, student_rows
 
 
 def _extract_exam_rows(
@@ -448,11 +457,19 @@ def admin_panel() -> str:
 @app.post("/api/v1/admin/upload/timetable")
 async def upload_timetable(file: UploadFile = File(...)) -> JSONResponse:
     workbook = await _read_workbook(file)
-    timetable_rows, student_rows = _extract_timetable_and_students(workbook)
+    course_rows, timetable_rows, student_rows = _extract_timetable_and_students(workbook)
 
     with get_connection() as conn:
+        conn.execute("DELETE FROM courses")
         conn.execute("DELETE FROM timetable")
         conn.execute("DELETE FROM students")
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO courses (code, batch, subject, teacher)
+            VALUES (?, ?, ?, ?)
+            """,
+            course_rows,
+        )
         conn.executemany(
             """
             INSERT OR REPLACE INTO timetable (day, location, slot, code)
@@ -473,7 +490,7 @@ async def upload_timetable(file: UploadFile = File(...)) -> JSONResponse:
         {
             "status": "ok",
             "message": "Timetable and students uploaded successfully.",
-            "inserted": {"timetable": len(timetable_rows), "students": len(student_rows)},
+            "inserted": {"courses": len(course_rows), "timetable": len(timetable_rows), "students": len(student_rows)},
         }
     )
 
@@ -550,9 +567,13 @@ def get_student_timetable(rollnumber: str) -> JSONResponse:
                 t.day AS day,
                 t.location AS location,
                 t.slot AS slot,
-                t.code AS course_code
+                c.code AS course_code,
+                c.subject AS subject,
+                c.teacher AS teacher,
+                c.batch AS batch
             FROM students s
-            INNER JOIN timetable t ON t.code = s.code
+            INNER JOIN courses c ON s.code = c.code
+            INNER JOIN timetable t ON t.code = c.code
             WHERE s.rollnumber = ?
             """,
             (roll,),
@@ -569,6 +590,9 @@ def get_student_timetable(rollnumber: str) -> JSONResponse:
                 "location": row["location"],
                 "time_slot": SLOT_TO_LABEL[slot],
                 "course_code": row["course_code"],
+                "subject": row["subject"],
+                "teacher": row["teacher"],
+                "batch": row["batch"],
             }
         )
     schedule.sort(
@@ -636,7 +660,7 @@ def get_student_lab_exams(rollnumber: str) -> JSONResponse:
                 "date": row["date"],
                 "venue": row["venue"],
                 "time": row["time"],
-                "extended_time": _lab_extended_time_label(row["time"]),
+                "extended_time": "", # CLEANED
                 "course_code": row["course_code"],
                 "batch": row["batch"],
                 "subject": row["subject"],
@@ -860,7 +884,7 @@ ADMIN_HTML = """<!DOCTYPE html>
         return `<strong>Roll ${esc(data.rollnumber)}</strong><br>No timetable entries found.`;
       }
       const sentenceList = rows
-        .map((r) => `<li>${esc(r.day)} - ${esc(r.time_slot)}: <b>${esc(r.course_code)}</b> in ${esc(r.location)}</li>`)
+        .map((r) => `<li>${esc(r.day)} - ${esc(r.time_slot)}: <b>${esc(r.course_code)}</b> (${esc(r.subject)}) by ${esc(r.teacher)} in ${esc(r.location)}</li>`)
         .join("");
       const tableRows = rows
         .map(
@@ -868,6 +892,8 @@ ADMIN_HTML = """<!DOCTYPE html>
             <td>${esc(r.day)}</td>
             <td>${esc(r.time_slot)}</td>
             <td>${esc(r.course_code)}</td>
+            <td>${esc(r.subject)}</td>
+            <td>${esc(r.teacher)}</td>
             <td>${esc(r.location)}</td>
           </tr>`
         )
@@ -877,7 +903,7 @@ ADMIN_HTML = """<!DOCTYPE html>
         <ul class="readable">${sentenceList}</ul>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Day</th><th>Time</th><th>Course Code</th><th>Location</th></tr></thead>
+            <thead><tr><th>Day</th><th>Time</th><th>Course Code</th><th>Subject</th><th>Teacher</th><th>Location</th></tr></thead>
             <tbody>${tableRows}</tbody>
           </table>
         </div>
